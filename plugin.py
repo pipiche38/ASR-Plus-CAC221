@@ -8,11 +8,12 @@
 # Version:    2.1.2: IR order repeat
 # Version:    3.1.1: Auto Coll mode
 # Version:    3.1.4: TimedOut and LAstupdate implemented
+# Version:    3.1.5: Clean logs way etc
 
 """
-<plugin key="AC-ASR-CAC221" name="AC Aircon Smart Remote PLUS for CAC221" author="MrErwan" version="3.1.4" externallink="https://github.com/Erwanweb/ASR-Plus-CAC221.git">
+<plugin key="AC-ASR-CAC221" name="AC Aircon Smart Remote PLUS for CAC221" author="MrErwan" version="3.1.5" externallink="https://github.com/Erwanweb/ASR-Plus-CAC221.git">
     <description>
-        <h2>Aircon Smart Remote V3.1.1</h2><br/>
+        <h2>Aircon Smart Remote V3.1.5</h2><br/>
         Easily implement in Domoticz an full control of air conditoner controled by IR Remote and using CAC221<br/>
         <h3>Set-up and Configuration</h3>
     </description>
@@ -26,14 +27,10 @@
         <param field="Mode5" label="Day/Night Activator, Pause On delay, Forced Eco Off delay (0=not timed), Presence On delay, Presence Off delay (all in minutes), reducted T(in degree), Delta max fanspeed (in in tenth of degre), IR Repeat order (0 not activ.)" width="200px" required="true" default="0,1,15,1,45,4,5,30"/>
         <param field="Mode6" label="Logging Level" width="200px">
             <options>
-                <option label="Normal" value="Normal"  default="true"/>
-                <option label="Verbose" value="Verbose"/>
+                <option label="Normal" value="0" default="true"/>
                 <option label="Debug - Python Only" value="2"/>
                 <option label="Debug - Basic" value="62"/>
-                <option label="Debug - Basic+Messages" value="126"/>
-                <option label="Debug - Connections Only" value="16"/>
-                <option label="Debug - Connections+Queue" value="144"/>
-                <option label="Debug - All" value="-1"/>
+                <option label="Debug - All" value="1"/>
             </options>
         </param>
     </params>
@@ -131,7 +128,6 @@ class BasePlugin:
             self.debug = True
             Domoticz.Debugging(debuglevel)
             DumpConfigToLog()
-            self.loglevel = "Verbose"
         else:
             self.debug = False
             Domoticz.Debugging(0)
@@ -764,7 +760,7 @@ class BasePlugin:
             Domoticz.Error("No Inside Temperature found or all are TimedOut... ")
             noerror = False
 
-        self.WriteLog("Inside Temperature = {}".format(self.intemp), "Verbose")
+        Domoticz.Debug("Inside Temperature = {}".format(self.intemp))
         return noerror
 
     def PresenceDetection(self):
@@ -861,7 +857,6 @@ class BasePlugin:
                     self.PresenceSensor = True
                     self.Presence = True
                     self.presencechangedtime = datetime.now()
-
             else:
                 if not self.PresenceSensor:
                     Domoticz.Debug("No presence detected DT already OFF...")
@@ -878,7 +873,6 @@ class BasePlugin:
                         self.PresenceTH = True
                         self.PresenceTHdelay = datetime.now()
                         Devices[6].Update(nValue=1, sValue=Devices[6].sValue)
-
                     else:
                         Domoticz.Debug("Presence is INACTIVE but in timer ON period !")
                 elif self.PresenceTH:
@@ -888,7 +882,6 @@ class BasePlugin:
                     if self.presencechangedtime + timedelta(minutes=self.presenceoffdelay) <= now:
                         Domoticz.Debug("Presence is now INACTIVE because no DT since more than X minutes !")
                         self.PresenceTH = False
-
                     else:
                         Domoticz.Debug("Presence is ACTIVE but in timer OFF period !")
                 else:
@@ -918,42 +911,29 @@ class BasePlugin:
                     Domoticz.Debug("WACsetpoint -  idx '{}' - '{}' -  Setpoint is '{}' ".format(idx, device["Name"], device["SetPoint"]))
                     Domoticz.Debug("CAC SETPOINT IS = {}".format(self.WACsetpointvalue))
 
-    def WriteLog(self, message, level="Normal"):
-
-        if self.loglevel == "Verbose" and level == "Verbose":
-            Domoticz.Log(message)
-        elif level == "Normal":
-            Domoticz.Log(message)
-
 
 # Plugin functions ---------------------------------------------------
 
 global _plugin
 _plugin = BasePlugin()
 
-
 def onStart():
     global _plugin
     _plugin.onStart()
-
 
 def onStop():
     global _plugin
     _plugin.onStop()
 
-
 def onCommand(Unit, Command, Level, Color):
     global _plugin
     _plugin.onCommand(Unit, Command, Level, Color)
-
 
 def onHeartbeat():
     global _plugin
     _plugin.onHeartbeat()
 
-
 # Plugin utility functions ---------------------------------------------------
-
 
 def parseCSV(strCSV):
     listvals = []
@@ -971,8 +951,6 @@ def parseCSV(strCSV):
             except ValueError:
                 Domoticz.Error(f"Skipping non-numeric value: '{value}'")
     return listvals
-
-
 
 def DomoticzAPI(APICall):
     resultJson = None
@@ -1004,8 +982,6 @@ def DomoticzAPI(APICall):
         Domoticz.Error(f"Error calling '{url}': {e}")
 
     return resultJson
-
-
 
 def CheckParam(name, value, default):
     try:
