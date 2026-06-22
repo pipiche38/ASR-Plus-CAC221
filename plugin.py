@@ -6,31 +6,39 @@
 # Version:    0.0.1: alpha...
 # Version:    2.1.1: overheat control
 # Version:    2.1.2: IR order repeat
-# Version:    3.1.1: Auto Coll mode
-# Version:    3.1.4: TimedOut and LAstupdate implemented
-# Version:    3.1.5: Clean logs way etc
 
 """
-<plugin key="AC-ASR-CAC221" name="AC Aircon Smart Remote PLUS for CAC221" author="MrErwan" version="3.1.5" externallink="https://github.com/Erwanweb/ASR-Plus-CAC221.git">
+<plugin key="AC-ASR-CAC221" name="AC Aircon Smart Remote PLUS for CAC221" author="MrErwan" version="2.1.2" externallink="https://github.com/Erwanweb/ASR-Plus-CAC221.git">
     <description>
-        <h2>Aircon Smart Remote V3.1.5</h2><br/>
-        Easily implement in Domoticz an full control of air conditoner controled by IR Remote and using CAC221<br/>
+        <h2>Aircon Smart Remote</h2><br/>
+        Easily implement in Domoticz an full control of air conditoner controled by IR Remote (using a CAC221 or a generic On/Off + mode + fanspeed widget set)<br/>
         <h3>Set-up and Configuration</h3>
     </description>
     <params>
-        <param field="Username" label="CAC221 widgets idx - AC mode" width="100px" required="true" default=""/>
-        <param field="Password" label="CAC221 widgets idx - AC fanspeed" width="100px" required="true" default=""/>
-        <param field="Mode1" label="CAC221 widgets idx - AC Setpoint" width="100px" required="true" default=""/>
+        <param field="Port" label="AC Model" width="200px">
+            <options>
+                <option label="CAC221" value="CAC221" default="true"/>
+                <option label="Generic-OnOff (HOT/COLD/FAN, multi-speed)" value="Generic-OnOff"/>
+            </options>
+        </param>
+        <param field="Address" label="On/Off widget idx (csv list, Generic model only)" width="100px" required="false" default=""/>
+        <param field="Username" label="AC mode widget idx (csv list)" width="100px" required="true" default=""/>
+        <param field="Password" label="AC fanspeed widget idx (csv list)" width="100px" required="true" default=""/>
+        <param field="Mode1" label="AC Setpoint widget idx (csv list)" width="100px" required="true" default=""/>
         <param field="Mode2" label="Pause sensors (csv list of idx)" width="100px" required="false" default=""/>
         <param field="Mode3" label="Presence Sensors (csv list of idx)" width="100px" required="false" default=""/>
         <param field="Mode4" label="Inside Temperature Sensors (csv list of idx)" width="100px" required="false" default="0"/>
-        <param field="Mode5" label="Day/Night Activator, Pause On delay, Forced Eco Off delay (0=not timed), Presence On delay, Presence Off delay (all in minutes), reducted T(in degree), Delta max fanspeed (in in tenth of degre), IR Repeat order (0 not activ.)" width="200px" required="true" default="0,1,15,1,45,4,5,30"/>
+        <param field="Mode5" label="Day/Night Activator, Pause On delay, Forced Eco Off delay (0=not timed), Presence On delay, Presence Off delay (all in minutes), reducted T(in degree), Delta max fanspeed (in in tenth of degre), IR Repeat order (0 not activ.)" width="200px" required="true" default="0,1,1,2,45,3,10,0"/>
         <param field="Mode6" label="Logging Level" width="200px">
             <options>
-                <option label="Normal" value="0" default="true"/>
+                <option label="Normal" value="Normal"  default="true"/>
+                <option label="Verbose" value="Verbose"/>
                 <option label="Debug - Python Only" value="2"/>
                 <option label="Debug - Basic" value="62"/>
-                <option label="Debug - All" value="1"/>
+                <option label="Debug - Basic+Messages" value="126"/>
+                <option label="Debug - Connections Only" value="16"/>
+                <option label="Debug - Connections+Queue" value="144"/>
+                <option label="Debug - All" value="-1"/>
             </options>
         </param>
     </params>
@@ -40,12 +48,41 @@
 import json
 import math
 import urllib
+import urllib.error
 import urllib.parse as parse
 import urllib.request as request
 from datetime import datetime, timedelta
 
 import Domoticz
-import requests
+
+try:
+    from Domoticz import Devices, Parameters
+except ImportError:
+    pass
+
+
+# Per-AC-model profiles. The control algorithm is single-sourced; only these
+# model-specific level numbers and selector labels change between models.
+#  - power_widget : True if power is driven by a dedicated On/Off switch widget,
+#                   False if power is implied by setting the mode widget to MODE_OFF.
+#  - MODE_HEAT / MODE_FAN / MODE_OFF : mode widget levels used by AUTO logic.
+#  - FAN_AUTO / FAN_BOOST / FAN_OVERHEAT : fan widget levels used by AUTO logic.
+#  - mode_names / fan_names : LevelNames for the plugin's own Device 2 / Device 3
+#                   selectors, built to match the physical widget level map so that
+#                   manual mode passes the selected level straight through.
+AC_PROFILES = {
+    "CAC221": dict(
+        power_widget=False, MODE_HEAT=30, MODE_FAN=50, MODE_OFF=0,
+        FAN_AUTO=10, FAN_BOOST=40, FAN_OVERHEAT=20,
+        mode_names="Off|Auto|Cool|Heat|Dry|Fan",
+        fan_names="Off|Auto|Low|Mid|High"),
+    "Generic-OnOff": dict(
+        power_widget=True, MODE_HEAT=40, MODE_FAN=50, MODE_OFF=0,
+        FAN_AUTO=10, FAN_BOOST=70, FAN_OVERHEAT=20,
+        mode_names="Off|Auto|Dry|Cold|Hot|Fan",
+        fan_names="Off|Auto|Silence|Lvl1|Lvl2|Lvl3|Lvl4|Lvl5"),
+}
+
 
 class deviceparam:
 
@@ -60,6 +97,20 @@ class BasePlugin:
 
     def __init__(self):
         self.debug = False
+        self.loglevel = "Normal"
+        self.powerOn = 0
+        # AC model profile (defaults to CAC221 ; overridden in onStart)
+        self.acmodel = "CAC221"
+        profile = AC_PROFILES["CAC221"]
+        self.power_widget = profile["power_widget"]
+        self.MODE_HEAT = profile["MODE_HEAT"]
+        self.MODE_FAN = profile["MODE_FAN"]
+        self.MODE_OFF = profile["MODE_OFF"]
+        self.FAN_AUTO = profile["FAN_AUTO"]
+        self.FAN_BOOST = profile["FAN_BOOST"]
+        self.FAN_OVERHEAT = profile["FAN_OVERHEAT"]
+        self.WAConoff = []
+        self.WAConoffvalue = False
         self.WACmode = []
         self.WACfanspeed = []
         self.WACsetpoint = []
@@ -72,12 +123,10 @@ class BasePlugin:
         self.WACmodevaluenew = 0
         self.WACfanspeedvaluenew = 0
         self.WACsetpointvaluenew = 21
-        self.powerOn = 0
         self.Turbopower = False
         self.Turbofan = False
         self.deltamax = 10  # allowed deltamax from setpoint for high level airfan
-        self.ModeAutoHeat = True
-        self.ModeAutoCool = False
+        self.ModeAuto = True
         self.DTpresence = []
         self.Presencemode = False
         self.ForcedEco = False
@@ -96,7 +145,6 @@ class BasePlugin:
         self.intemp = 25.0
         self.overheat = False
         self.overheatvalue = 1
-        self.undervalue = 1
         self.setpointnew = 21
         self.setpointadjusted = 21
         self.repeatorder = 0
@@ -113,8 +161,6 @@ class BasePlugin:
         self.controloverheatvalue = now
         self.repeatordertime = now
         self.PLUGINstarteddtime = now
-        self.DTexcludedUntil = {}
-        self.TempExcludedUntil = {}
 
     def onStart(self):
         Domoticz.Log("onStart called")
@@ -128,15 +174,30 @@ class BasePlugin:
             self.debug = True
             Domoticz.Debugging(debuglevel)
             DumpConfigToLog()
+            self.loglevel = "Verbose"
         else:
             self.debug = False
             Domoticz.Debugging(0)
+
+        # select the AC model profile and copy its level constants / labels
+        self.acmodel = Parameters["Port"] if Parameters["Port"] in AC_PROFILES else "CAC221"
+        if Parameters["Port"] not in AC_PROFILES:
+            Domoticz.Error("Unknown AC Model '{}' - falling back to 'CAC221'".format(Parameters["Port"]))
+        profile = AC_PROFILES[self.acmodel]
+        self.power_widget = profile["power_widget"]
+        self.MODE_HEAT = profile["MODE_HEAT"]
+        self.MODE_FAN = profile["MODE_FAN"]
+        self.MODE_OFF = profile["MODE_OFF"]
+        self.FAN_AUTO = profile["FAN_AUTO"]
+        self.FAN_BOOST = profile["FAN_BOOST"]
+        self.FAN_OVERHEAT = profile["FAN_OVERHEAT"]
+        Domoticz.Debug("AC model = '{}' (power_widget={})".format(self.acmodel, self.power_widget))
 
         # create the child devices if these do not exist yet
         devicecreated = []
         if 1 not in Devices:
             Options = {"LevelActions": "||",
-                       "LevelNames": "Disconnected|Off|Manual|Auto Heat|Auto Cool",
+                       "LevelNames": "Disconnected|Off|Auto|Manual",
                        "LevelOffHidden": "true",
                        "SelectorStyle": "0"}
             Domoticz.Device(Name="Control", Unit=1, TypeName="Selector Switch", Switchtype=18, Image=9,
@@ -144,20 +205,20 @@ class BasePlugin:
             devicecreated.append(deviceparam(1, 0, "10"))  # default is Off
         if 2 not in Devices:
             Options = {"LevelActions": "||",
-                       "LevelNames": "Off|Auto|Cool|Heat|Dry|Fan",
+                       "LevelNames": profile["mode_names"],
                        "LevelOffHidden": "true",
                        "SelectorStyle": "0"}
             Domoticz.Device(Name="AC Manual Mode", Unit=2, TypeName="Selector Switch", Switchtype=18, Image=15,
                             Options=Options, Used=1).Create()
-            devicecreated.append(deviceparam(2, 0, "30"))  # default is Heating mode
+            devicecreated.append(deviceparam(2, 0, str(self.MODE_HEAT)))  # default is Heating mode
         if 3 not in Devices:
             Options = {"LevelActions": "||",
-                       "LevelNames": "Off|Auto|Low|Mid|High",
+                       "LevelNames": profile["fan_names"],
                        "LevelOffHidden": "true",
                        "SelectorStyle": "0"}
             Domoticz.Device(Name="AC Manual Fan Speed", Unit=3, TypeName="Selector Switch", Switchtype=18, Image=15,
                             Options=Options, Used=1).Create()
-            devicecreated.append(deviceparam(3, 0, "10"))  # default is Auto mode
+            devicecreated.append(deviceparam(3, 0, str(self.FAN_AUTO)))  # default is Auto mode
         if 4 not in Devices:
             Domoticz.Device(Name="Forced ECO", Unit=4, TypeName="Switch", Image=9).Create()
             devicecreated.append(deviceparam(4, 0, ""))  # default is Off
@@ -173,15 +234,19 @@ class BasePlugin:
         if 8 not in Devices:
             Domoticz.Device(Name="Pause requested", Unit=8, TypeName="Switch", Image=9, Used=1).Create()
             devicecreated.append(deviceparam(8, 0, ""))  # default is Off
-        # if 9 not in Devices:
-        # Domoticz.Device(Name = "AC Setpoint",Unit=9,Type = 242,Subtype = 1).Create()
-        # devicecreated.append(deviceparam(9,0,"20"))  # default is 20 degrees
 
         # if any device has been created in onStart(), now is time to update its defaults
         for device in devicecreated:
             Devices[device.unit].Update(nValue=device.nvalue, sValue=device.svalue)
 
-        # build lists of idx widget of CAC221
+        # keep the manual mode/fan selectors in sync with the selected model on
+        # installs where the devices already existed before the model was changed
+        self.syncSelectorOptions(2, profile["mode_names"])
+        self.syncSelectorOptions(3, profile["fan_names"])
+
+        # build lists of idx widget of the AC
+        self.WAConoff = parseCSV(Parameters["Address"])
+        Domoticz.Debug("AC On/Off widget idx = {}".format(self.WAConoff))
         self.WACmode = parseCSV(Parameters["Username"])
         Domoticz.Debug("AC mode widget idx = {}".format(self.WACmode))
         self.WACfanspeed = parseCSV(Parameters["Password"])
@@ -198,7 +263,7 @@ class BasePlugin:
         # splits additional parameters
         params5 = parseCSV(Parameters["Mode5"])
         if len(params5) == 8:
-            self.DTDayNight = CheckParam("Day/Night Activator", params5[0], 0)
+            # params5[0] (Day/Night Activator) is reserved but not yet used
             self.pauseondelay = CheckParam("Pause On Delay", params5[1], 1)
             self.ForcedECOoffdelay = CheckParam("ForcedECO Off Delay", params5[2], 30)
             self.presenceondelay = CheckParam("Presence On Delay", params5[3], 2)
@@ -211,23 +276,15 @@ class BasePlugin:
 
         # Check if the used control mode is ok
         if (Devices[1].sValue == "20"):
-            self.ModeAutoHeat = False
-            self.ModeAutoCool = False
+            self.ModeAuto = True
             self.powerOn = 1
 
         elif (Devices[1].sValue == "30"):
-            self.ModeAutoHeat = True
-            self.ModeAutoCool = False
-            self.powerOn = 1
-
-        elif (Devices[1].sValue == "40"):
-            self.ModeAutoHeat = False
-            self.ModeAutoCool = True
+            self.ModeAuto = False
             self.powerOn = 1
 
         elif (Devices[1].sValue == "10"):
-            self.ModeAutoHeat = False
-            self.ModeAutoCool = False
+            self.ModeAuto = False
             self.powerOn = 0
 
         # reset presence detection when starting the plugin.
@@ -246,6 +303,12 @@ class BasePlugin:
         # Set domoticz heartbeat to 20 s (onheattbeat() will be called every 20 )
         Domoticz.Heartbeat(20)
 
+        # update temp
+        self.readTemps()
+
+        # update widget values
+        # self.CAC221widgetcontrol()
+
     def onStop(self):
         Domoticz.Log("onStop called")
         Domoticz.Debugging(0)
@@ -254,45 +317,30 @@ class BasePlugin:
         Domoticz.Log(
             "onCommand called for Unit " + str(Unit) + ": Parameter '" + str(Command) + "', Level: " + str(Level))
 
-        now = datetime.now()
-
         # Thermostat control
         if (Unit == 1):
             Devices[1].Update(nValue=self.powerOn, sValue=str(Level))
-            if (Devices[1].sValue == "20"):  # Mode manuel
-                self.ModeAutoHeat = False
-                self.ModeAutoCool = False
-                self.Turbofan = False
-                self.Turbopower = False
+            if (Devices[1].sValue == "20"):  # Mode auto
+                self.ModeAuto = True
                 self.powerOn = 1
+                Devices[2].Update(nValue=self.powerOn, sValue=str(self.MODE_HEAT))  # AC mode Heat
+                Devices[3].Update(nValue=self.powerOn, sValue=str(self.FAN_AUTO))  # AC Fan Speed Auto
+                self.setPower(True)
 
-            elif (Devices[1].sValue == "30"):  # Mode auto heat
-                self.ModeAutoHeat = True
-                self.ModeAutoCool = False
+            elif (Devices[1].sValue == "30"):  # Mode manuel
+                self.ModeAuto = False
                 self.Turbofan = False
                 self.Turbopower = False
                 self.powerOn = 1
-                Devices[2].Update(nValue=self.powerOn, sValue="30")  # AC mode Heat
-                Devices[3].Update(nValue=self.powerOn, sValue="10")  # AC Fan Speed Auto
-
-            elif (Devices[1].sValue == "40"):  # Mode auto cool
-                self.ModeAutoHeat = False
-                self.ModeAutoCool = True
-                self.Turbofan = False
-                self.Turbopower = False
-                self.powerOn = 1
-                Devices[2].Update(nValue=self.powerOn, sValue="20")  # AC mode Heat
-                Devices[3].Update(nValue=self.powerOn, sValue="10")  # AC Fan Speed Auto
+                self.setPower(True)
 
             elif (Devices[1].sValue == "10"):  # Arret
                 self.powerOn = 0
-                self.ModeAutoHeat = False
-                self.ModeAutoCool = False
+                self.ModeAuto = False
                 self.Turbofan = False
                 self.Turbopower = False
                 Devices[1].Update(nValue=0, sValue="10")
-                for idx in self.WACmode:
-                    DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=0".format(idx))
+                self.setPower(False)
 
             # Update devices
             Devices[1].Update(nValue=self.powerOn, sValue=Devices[1].sValue)
@@ -308,7 +356,7 @@ class BasePlugin:
 
         if (Unit == 4):  # Forced ECO
             if self.powerOn :
-                Devices[4].Update(self.powerOn, sValue=Devices[4].sValue)
+                Devices[4].Update(nValue=1, sValue=Devices[4].sValue)
                 Domoticz.Debug("Forced ECO Requested")
                 self.ForcedEco = True
                 self.ForcedEcoTime = datetime.now()
@@ -330,440 +378,252 @@ class BasePlugin:
 
         now = datetime.now()
 
+        # Fetch all used devices once and share the result with the consumers
+        # below, instead of issuing one getdevices call per consumer.
+        devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=all&used=true&order=Name")
+
         # check if CAC widget are ok
-        self.CAC221widgetcontrol()
+        self.CAC221widgetcontrol(devicesAPI)
+        # check presence detection
+        self.PresenceDetection(devicesAPI)
 
-        if not self.PLUGINstarteddtime + timedelta(minutes=2) <= now:
-            Domoticz.Log("---> Plugin starting.... Wait a while") # we wait for Zigbee plugin starting well and all others needed...
-
-        else : # Plugin really started.....
-            # check presence detection
-            self.PresenceDetection()
-
-            # REPEAT IR ORDER -----------------------------------------------------------------------------------------------------
-            if self.repeatorder > 0:  # We repeat IR order to be sure AC received and take the good one
-                Domoticz.Debug("Repeating IR Order is activated")
-                if self.repeatordertime + timedelta(minutes=self.repeatorder) <= now:
-                    if self.powerOn:
+        # REPEAT IR ORDER -----------------------------------------------------------------------------------------------------
+        if self.powerOn:
+            if self.ModeAuto:
+                if self.repeatorder > 0:  # We repeat IR order to be sure AC received and take the good one
+                    Domoticz.Debug("Repeating IR Order is activate ")
+                    if self.repeatordertime + timedelta(minutes=self.repeatorder) <= now:
                         for idx in self.WACfanspeed:
                             DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx,self.WACfanspeedvalue))
-                        for idx in self.WACmode:
-                            DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx,self.WACmodevalue))
-                        for idx in self.WACsetpoint:
-                            DomoticzAPI("type=command&param=setsetpoint&idx={}&setpoint={}".format(idx, self.setpoint))
-                        Domoticz.Debug("-------------> Repeating IR Order in ACTIVE mode")
-                    else:
-                        for idx in self.WACmode:
-                            DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=0".format(idx))
-                        Domoticz.Debug("-------------> Repeating IR Order in OFF mode (forcing AC OFF)")
-                    self.repeatordertime = datetime.now()
-            else:
-                Domoticz.Debug("NO Repeating IR Order - Function is deactivated")
+                        self.repeatordertime = datetime.now()
+                        Domoticz.Debug("-------------> Repeating IR Order")
+                else:
+                    Domoticz.Debug("NO Repeating IR Order - Function is desactivate ")
 
-            # CHECK FORCED ECO PERIOD
-
-            # CHECK FORCED ECO PERIOD ----------------------------------------------------------------------------------------------
-            if self.ForcedEco:
-                #if self.ForcedECOoffdelay != 0
-                if self.ForcedEcoTime + timedelta(minutes=self.ForcedECOoffdelay) <= now:
-                    self.ForcedEco = False
-                    Domoticz.Debug("Forced ECO not Request anymore")
-                    if Devices[4].nValue == 1:
-                        Devices[4].Update(nValue=0, sValue=Devices[4].sValue)
-            else:
+        # CHECK FORCED ECO PERIOD ----------------------------------------------------------------------------------------------
+        if self.ForcedEco:
+            #if self.ForcedECOoffdelay != 0
+            if self.ForcedEcoTime + timedelta(minutes=self.ForcedECOoffdelay) <= now:
+                self.ForcedEco = False
+                Domoticz.Debug("Forced ECO not Request anymore")
                 if Devices[4].nValue == 1:
                     Devices[4].Update(nValue=0, sValue=Devices[4].sValue)
+        else:
+            if Devices[4].nValue == 1:
+                Devices[4].Update(nValue=0, sValue=Devices[4].sValue)
 
-            # MODE CHECK  ----------------------------------------------------------------------------------------------------------
-            # Check the mode, used setpoint and fan speed is ok
-            if not self.powerOn:
-                if not self.WACmodevalue == 0:
-                    for idx in self.WACmode:
-                        DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=0".format(idx))
-                        Domoticz.Debug("WACmode isn't at good Level at '{}'- Updating AC mode widget Level at '0'".format(self.WACmodevalue))
-                        self.repeatordertime = datetime.now()
-                    #self.WACmodevalue = 0
-            else:
+        # MODE CHECK  ----------------------------------------------------------------------------------------------------------
+        # Check the mode, used setpoint and fan speed is ok
+        if not self.powerOn:
+            self.setPower(False)
+        else:
+            self.setPower(True)
+            if self.ModeAuto:  # Auto Mode
 
-    # MODE AUTO HEAT ------------------------------------------------------------------------------------
-                if self.ModeAutoHeat:  # Auto Mode Heat
-                    # CHOOSING AC SETPOINT IN AUTO HEAT MODE ------------------------------------------------------------------------------------
-                    # Choose AC setpoint if presence or not and check if AC setpoint is over and need adjustment
-                    if self.PresenceTH:  # We use normal thermostat setpoint for confort
-                        self.setpoint = round(float(Devices[5].sValue))
-                    else:  # No presence detected so we use reducted thermosat setpoint
-                        self.setpoint = round(float(Devices[5].sValue) - self.reductedsp)
-                    #self.overheatvalue = round((self.intemp - self.setpoint),1)
-                    if self.intemp >= (self.setpoint - 0.1) :
-                        if self.intemp > (self.setpoint + 1.0) :
-                            self.overheatvalue = round((self.intemp - self.setpoint) +4)
-                        elif self.intemp > (self.setpoint + 0.5) :
-                            self.overheatvalue = math.ceil((self.intemp - self.setpoint) +3)
-                        elif self.intemp > (self.setpoint + 0.3) :
-                            self.overheatvalue = math.ceil((self.intemp - self.setpoint) +2)
-                        elif self.intemp > self.setpoint :
-                            self.overheatvalue = math.ceil((self.intemp - self.setpoint) +1)
-                        else :
-                            #self.overheatvalue = math.ceil(self.intemp - self.setpoint)
-                            self.overheatvalue = 1
-                    else :
-                        self.overheatvalue = round((self.intemp - self.setpoint), 1)
-                    self.setpointadjusted = (self.setpoint - self.overheatvalue)
-                    self.setpoint = round(self.setpointadjusted)
-                    Domoticz.Debug("Delta between Room and setpoint is '{}' - New AC Setpoint after correction is '{}'".format(self.overheatvalue, self.setpoint))
-
-                    if self.PresenceTH:
-                        if self.intemp < (float(Devices[5].sValue) - 0.2):
-                            self.overheat = False
-                            if self.setpoint < 17:
-                                self.setpoint = 17
-                            Domoticz.Debug("NO Overheat - AC Setpoint is '{}'".format(self.setpoint))
-
-                    else :  # No presence detected so we use reducted thermosat setpoint
-                        if self.intemp < ((float(Devices[5].sValue) - 0.2) - self.reductedsp):
-                            self.overheat = False
-                            if self.setpoint < 17:
-                                self.setpoint = 17
-                            Domoticz.Debug("NO Overheat - No Presence - AC Reducted Setpoint is '{}'".format(self.setpoint))
-
-                    # OVERHEAT ----------------------------------------------------------------------------------------------------------
-                    # check if overheat
-                    if self.setpoint < 17:
-                        if not self.overheat:
-                            self.overheat = True
-                            self.Turbofan = False
-                            self.Turbopower = False
-                    else:
-                        self.overheat = False
-                        #self.setpoint = self.septpointadjusted
-
-                    # force heating mode or fan if overheat
-                    if self.overheat :
-                        Domoticz.Debug("AC present overheating of '{}' - Setpoint is '{}' for Room Temp '{}'".format(self.overheatvalue, self.setpoint, self.intemp))
-                        if not self.WACmodevalue == 50:
-                            for idx in self.WACmode:
-                                DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=50".format(idx))
-                            Domoticz.Debug("WACmode isn't at good Level at '{}'- Updating AC mode widget Level at '50' for fan only".format(self.WACmodevalue))
-                            self.repeatordertime = datetime.now()
-                        if not self.WACfanspeedvalue == 20:
-                            for idx in self.WACfanspeed:
-                                DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=20".format(idx))
-                            Domoticz.Debug("WACfanspeed isn't at good Level at '{}'- Updating AC fanspeed widget Level at '20'".format(self.WACfanspeedvalue))
-                            self.repeatordertime = datetime.now()
-                    else :  # no overheating, so heating Mode and auto control
-                        Domoticz.Debug("AC no present overheat - Setpoint is '{}' for Room Temp '{}'".format(self.setpoint, self.intemp))
-                        if not self.WACmodevalue == 30:
-                            for idx in self.WACmode:
-                                DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=30".format(idx))
-                            Domoticz.Debug("WACmode isn't at good Level at '{}'- Updating AC mode widget Level at '30' for heating".format(self.WACmodevalue))
-                            self.repeatordertime = datetime.now()
-
-                        # NORMAL AUTO MODE -----------------------------------------------------------------------------------------------------
-                        if not self.PresenceTH:
-                            self.Turbofan = False
-                            self.Turbopower = False
-                        else :
-                            # check if turbo needed
-                            if self.intemp < (float(Devices[5].sValue) - (self.deltamax / 10)):
-                                self.Turbofan = True
-                            if self.intemp < (float(Devices[5].sValue) - ((self.deltamax / 10) + (self.deltamax / 20))):
-                                self.Turbopower = True
-
-                        # check if Turbofan is on
-                        if self.Turbofan:  # Turbofan is on
-                            Domoticz.Debug("AUTOMode - Turbofan ON - Fan speed high because room temp is too far from delta min setpoint")
-                            if not Devices[3].sValue == "40":
-                                Devices[3].Update(nValue=self.powerOn, sValue="40")
-                            if not self.WACfanspeedvalue == 40:
-                                for idx in self.WACfanspeed:
-                                    DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=40".format(idx))
-                                Domoticz.Debug("WACfanspeed isn't at good Level at '{}'- Updating AC fanspeed widget Level at '40'".format(self.WACfanspeedvalue))
-                                self.repeatordertime = datetime.now()
-                                # check if turbofan still needed or not
-                            if self.intemp > (float(Devices[5].sValue) - (self.deltamax / 20)):
-                                self.Turbofan = False
-                        else:  # Turbofan is off
-                            Domoticz.Debug("AUTOMode - Turbofan OFF - Fan speed auto because room temp is near from setpoint")
-                            if not Devices[3].sValue == "10":
-                                Devices[3].Update(nValue=self.powerOn, sValue="10")
-                            if not self.WACfanspeedvalue == 10:
-                                for idx in self.WACfanspeed:
-                                    DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=10".format(idx))
-                                Domoticz.Debug("WACfanspeed isn't at good Level at '{}'- Updating AC fanspeed widget Level at '10'".format(self.WACfanspeedvalue))
-                                self.repeatordertime = datetime.now()
-
-                        # check if Turbopower is on
-                        if self.Turbopower:  # Turbopower is on
-                            self.setpoint = 30
-                            Domoticz.Debug("AUTOMode - Turbopower ON - Used setpoint is Max '30' because room temp is lower more than delta min from setpoint")
-                            if not self.WACsetpointvalue == self.setpoint:
-                                for idx in self.WACsetpoint:
-                                    DomoticzAPI("type=command&param=setsetpoint&idx={}&setpoint={}".format(idx, self.setpoint))
-                                Domoticz.Debug("AC Setpoint is not ok - Updating AC setpoint to : " + str(self.setpoint))
-                                self.repeatordertime = datetime.now()
-                                # self.WACsetpointvalue = self.setpoint
-                            # check if turbopower still needed or not
-                            if self.intemp > (float(Devices[5].sValue) - (self.deltamax / 10)):
-                                self.Turbopower = False
-                        else:  # Turbopower is off
-                            Domoticz.Debug("AUTOMode - Turbopower OFF - Used setpoint is normal : " + str(self.setpoint))
-                            self.setpoint = round(self.setpointadjusted)
-                            if not self.WACsetpointvalue == self.setpoint:
-                                for idx in self.WACsetpoint:
-                                    DomoticzAPI("type=command&param=setsetpoint&idx={}&setpoint={}".format(idx, self.setpoint))
-                                Domoticz.Debug("AC Setpoint is not ok - Updating AC setpoint to : " + str(self.setpoint))
-                                self.repeatordertime = datetime.now()
-
-    # MODE AUTO COOL ------------------------------------------------------------------------------------
-                elif self.ModeAutoCool:  # Auto Mode Cool
-                    # CHOOSING AC SETPOINT IN AUTO MODE ------------------------------------------------------------------------------------
-                    # Choose AC setpoint if presence or not and check if AC setpoint is over and need adjustment
-                    if self.PresenceTH: # We use normal thermostat setpoint for confort
-                        self.setpoint = round(float(Devices[5].sValue))
-                    else: # No presence detected so we use reducted thermosat setpoint
-                        self.setpoint = round(float(Devices[5].sValue) + self.reductedsp)
-                    if self.intemp <= (self.setpoint + 0.1):
-                        if self.intemp < (self.setpoint - 1.0):
-                            self.undervalue = round((self.setpoint - self.intemp) + 3)
-                        elif self.intemp < (self.setpoint - 0.6):
-                            self.undervalue = math.ceil((self.setpoint - self.intemp) + 2)
-                        elif self.intemp < (self.setpoint - 0.3):
-                            self.undervalue = math.ceil((self.setpoint - self.intemp) + 1)
-                        elif self.intemp < self.setpoint :
-                            self.undervalue = math.ceil(self.setpoint - self.intemp)
-                        else:
-                            self.undervalue = -1
-                    else:
-                        self.undervalue = round(((self.setpoint - self.intemp)-1), 1)
-
-                    self.setpointadjusted = self.setpoint + self.undervalue
-                    self.setpoint = round(self.setpointadjusted)
-                    Domoticz.Debug( "AUTO COOL LOG -- Room Temp: {:.2f}, Thermostat Setpoint: {:.2f}, Initial Delta: {:.2f}, Adjusted Undervalue: {}, Final Setpoint: {}".format(
-                            self.intemp,
-                            float(Devices[5].sValue),
-                            self.setpoint - self.intemp,
-                            self.undervalue,
-                            self.setpoint
-                        ))
-                    Domoticz.Debug("Delta between Room and setpoint is '{}' - New AC Setpoint after correction is '{}'".format(self.undervalue, self.setpoint))
-
-                    if self.PresenceTH:
-                        if self.intemp > (float(Devices[5].sValue) + 0.2):
-                            self.overheat = False
-                            if self.setpoint > 30:
-                                self.setpoint = 30
-                            Domoticz.Debug("NO Undercool - AC Setpoint is '{}'".format(self.setpoint))
-
-                    else:  # No presence detected so we use increased thermostat setpoint
-                        if self.intemp > ((float(Devices[5].sValue) + 0.2) + self.reductedsp):
-                            self.overheat = False
-                            if self.setpoint > 30:
-                                self.setpoint = 30
-                            Domoticz.Debug("NO Undercool - No Presence - AC Increased Setpoint is '{}'".format(self.setpoint))
-
-
-                    # UNDERCOOL ----------------------------------------------------------------------------------------------------------
-                    # check if undercool
-                    if self.setpoint > 30:
-                        if not self.overheat:
-                            self.overheat = True
-                            self.Turbofan = False
-                            self.Turbopower = False
-                    else:
-                        self.overheat = False
-
-                    # force fan only mode if undercool
-                    if self.overheat:
-                        Domoticz.Debug("AC present undercooling of '{}' - Setpoint is '{}' for Room Temp '{}'".format(self.undervalue,self.setpoint,self.intemp))
-                        if not self.WACmodevalue == 50:
-                            for idx in self.WACmode:
-                                DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=50".format(idx))
-                            Domoticz.Debug("WACmode isn't at good Level at '{}'- Updating AC mode widget Level at '50' for fan only".format(self.WACmodevalue))
-                            self.repeatordertime = datetime.now()
-                        if not self.WACfanspeedvalue == 20:
-                            for idx in self.WACfanspeed:
-                                DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=20".format(idx))
-                            Domoticz.Debug("WACfanspeed isn't at good Level at '{}'- Updating AC fanspeed widget Level at '20'".format(self.WACfanspeedvalue))
-                            self.repeatordertime = datetime.now()
-                    else:  # no undercooling, so cooling Mode and auto control
-                        Domoticz.Debug("AC no present undercooling - Setpoint is '{}' for Room Temp '{}'".format(self.setpoint,self.intemp))
-                        if not self.WACmodevalue == 20:
-                            for idx in self.WACmode:
-                                DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level=20".format(idx))
-                            Domoticz.Debug("WACmode isn't at good Level at '{}'- Updating AC mode widget Level at '20' for cooling".format( self.WACmodevalue))
-                            self.repeatordertime = datetime.now()
-
-                        # NORMAL AUTO MODE COOL -------------------------------------------------------------------------------
-                        if not self.PresenceTH:
-                            self.Turbofan = False
-                            self.Turbopower = False
-                        else :
-                            # check if turbo needed
-                            if self.intemp > (float(Devices[5].sValue) + (self.deltamax / 10)):
-                                self.Turbofan = True
-                            if self.intemp > (float(Devices[5].sValue) + ((self.deltamax / 10) + (self.deltamax / 20))):
-                                self.Turbopower = True
-
-                        # Mode Cool
-                        if not self.WACmodevalue == 20:
-                            for idx in self.WACmode:
-                                DomoticzAPI(f"type=command&param=switchlight&idx={idx}&switchcmd=Set Level&level=20")
-                            Domoticz.Debug(f"WACmode isn't at good Level '{self.WACmodevalue}' - Updating AC mode to Cool (20)")
-                            self.repeatordertime = datetime.now()
-
-                        # Fan Speed check if Turbofan is on
-                        if self.Turbofan:
-                            Domoticz.Debug("AUTOMode COOL- Turbofan ON - Fan speed high because room temp is too far from delta min setpoint")
-                            if not Devices[3].sValue == "40":
-                                Devices[3].Update(nValue=self.powerOn, sValue="40")
-                            if not self.WACfanspeedvalue == 40:
-                                for idx in self.WACfanspeed:
-                                    DomoticzAPI(f"type=command&param=switchlight&idx={idx}&switchcmd=Set Level&level=40")
-                                Domoticz.Debug(f"WACfanspeed updated to High (40)")
-                                self.repeatordertime = datetime.now()
-                            # check if turbofan still needed or not
-                            if self.intemp < (float(Devices[5].sValue) + (self.deltamax / 20)):
-                                self.Turbofan = False
-                        else: # Turbofan is off
-                            Domoticz.Debug("AUTOMode COOL- Turbofan OFF - Fan speed auto because room temp is near from setpoint")
-                            if not Devices[3].sValue == "10":
-                                Devices[3].Update(nValue=self.powerOn, sValue="10")
-                            if not self.WACfanspeedvalue == 10:
-                                for idx in self.WACfanspeed:
-                                    DomoticzAPI(f"type=command&param=switchlight&idx={idx}&switchcmd=Set Level&level=10")
-                                Domoticz.Debug(f"WACfanspeed updated to Auto (10)")
-                                self.repeatordertime = datetime.now()
-
-                        # check if Turbopower is on
-                        if self.Turbopower:
-                            self.setpoint = 17  # forcé pour refroidissement rapide
-                            Domoticz.Debug(f"AUTO COOL - TurboPower ON - Forcing setpoint to 17")
-                            if not self.WACsetpointvalue == self.setpoint:
-                                for idx in self.WACsetpoint:
-                                    DomoticzAPI(f"type=command&param=setsetpoint&idx={idx}&setpoint={self.setpoint}")
-                                Domoticz.Debug(f"Setpoint updated to: {self.setpoint}")
-                                self.repeatordertime = datetime.now()
-                            if self.intemp > (float(Devices[5].sValue) + (self.deltamax / 10)):
-                                self.Turbopower = False
-                        else:  # Turbopower is off
-                            Domoticz.Debug("AUTOMode - Turbopower OFF - Used setpoint is normal : " + str(self.setpoint))
-                            self.setpoint = round(self.setpointadjusted)
-                            if not self.WACsetpointvalue == self.setpoint:
-                                for idx in self.WACsetpoint:
-                                    DomoticzAPI("type=command&param=setsetpoint&idx={}&setpoint={}".format(idx, self.setpoint))
-                                Domoticz.Debug("AC Setpoint is not ok - Updating AC setpoint to : " + str(self.setpoint))
-                                self.repeatordertime = datetime.now()
-
-    # MANUAL MODE ----------------------------------------------------------------------------------------------------------
-                else:  # Manual Mode
+                # CHOOSING AC SETPOINT IN AUTO MODE ------------------------------------------------------------------------------------
+                # Choose AC setpoint if presence or not and check if AC setpoint is over and need adjustment
+                if self.PresenceTH:  # We use normal thermostat setpoint for confort
                     self.setpoint = round(float(Devices[5].sValue))
-                    # check manual asked mode
-                    if Devices[2].sValue == "10":
-                        self.WACmodevaluenew = 10
-                    elif Devices[2].sValue == "20":
-                        self.WACmodevaluenew = 20
-                    elif Devices[2].sValue == "30":
-                        self.WACmodevaluenew = 30
-                    elif Devices[2].sValue == "40":
-                        self.WACmodevaluenew = 40
-                    elif Devices[2].sValue == "50":
-                        self.WACmodevaluenew = 50
-                    # check if wac is ok
-                    if not self.WACmodevaluenew == self.WACmodevalue:
-                        for idx in self.WACmode:
-                            DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx,self.WACmodevaluenew))
-                        self.repeatordertime = datetime.now()
-                        Domoticz.Debug("Manual mode - MODE = {}".format(self.WACmodevaluenew))
-                    if not Devices[3].sValue == str(self.WACfanspeedvalue):
-                        for idx in self.WACfanspeed:
-                            DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx,str(Devices[3].sValue)))
-                        self.repeatordertime = datetime.now()
-                        Domoticz.Debug("Manual mode - FANSPEED = {}".format(self.WACfanspeedvalue))
-                    if not self.WACsetpointvalue == self.setpoint:
-                        for idx in self.WACsetpoint:
-                            DomoticzAPI("type=command&param=setsetpoint&idx={}&setpoint={}".format(idx, self.setpoint))
-                        self.repeatordertime = datetime.now()
-                        Domoticz.Debug("AC Setpoint is not ok - Updating AC setpoint to : " + str(self.setpoint))
+                else:  # No presence detected so we use reducted thermosat setpoint
+                    self.setpoint = round(float(Devices[5].sValue) - self.reductedsp)
+                #self.overheatvalue = round((self.intemp - self.setpoint),1)
+                if self.intemp >= (self.setpoint - 0.1) :
+                    if self.intemp > (self.setpoint + 1.0) :
+                        self.overheatvalue = round((self.intemp - self.setpoint) +4)
+                    elif self.intemp > (self.setpoint + 0.5) :
+                        self.overheatvalue = math.ceil((self.intemp - self.setpoint) +3)
+                    elif self.intemp > (self.setpoint + 0.3) :
+                        self.overheatvalue = math.ceil((self.intemp - self.setpoint) +2)
+                    elif self.intemp > self.setpoint :
+                        self.overheatvalue = math.ceil((self.intemp - self.setpoint) +1)
+                    else :
+                        #self.overheatvalue = math.ceil(self.intemp - self.setpoint)
+                        self.overheatvalue = 1
+                else :
+                    self.overheatvalue = round((self.intemp - self.setpoint), 1)
+                self.setpointadjusted = (self.setpoint - self.overheatvalue)
+                self.setpoint = round(self.setpointadjusted)
+                Domoticz.Debug("Delta between Room and setpoint is '{}' - New AC Setpoint after correction is '{}'".format(self.overheatvalue, self.setpoint))
 
-            # READING ROOM TEMP ----------------------------------------------------------------------------------------------------
-            if self.PLUGINstarteddtime + timedelta(minutes=2) <= now:
-                if self.nexttemps + timedelta(seconds=60) <= now:
-                    self.readTemps()
+                if self.PresenceTH:
+                    if self.intemp < (float(Devices[5].sValue) - 0.2):
+                        self.overheat = False
+                        if self.setpoint < 17:
+                            self.setpoint = 17
+                        Domoticz.Debug("NO Overheat - AC Setpoint is '{}'".format(self.setpoint))
 
-            # NORMAL LOG -----------------------------------------------------------------------------------------------------------
-            if self.powerOn:
-                if self.ModeAutoHeat:
-                    Domoticz.Log("System ON - AUTO HEAT - Room Temp : {}ºC - System Setpoint : '{}' - Aircon Setpoint : '{}' ".format(self.intemp, self.pluginsetpoint, self.setpoint))
-                elif self.ModeAutoCool:
-                    Domoticz.Log("System ON - AUTO COOL - Room Temp : {}ºC - System Setpoint : '{}' - Aircon Setpoint : '{}' ".format(self.intemp, self.pluginsetpoint, self.setpoint))
+                else :  # No presence detected so we use reducted thermosat setpoint
+                    if self.intemp < ((float(Devices[5].sValue) - 0.2) - self.reductedsp):
+                        self.overheat = False
+                        if self.setpoint < 17:
+                            self.setpoint = 17
+                        Domoticz.Debug("NO Overheat - No Presence - AC Reducted Setpoint is '{}'".format(self.setpoint))
+
+                # OVERHEAT ----------------------------------------------------------------------------------------------------------
+                # check if overheat
+                if self.setpoint < 17:
+                    if not self.overheat:
+                        self.overheat = True
+                        self.Turbofan = False
+                        self.Turbopower = False
                 else:
-                    Domoticz.Log("System ON - MANUAL - Room Temp : {}ºC - System Setpoint : '{}' - Aircon Setpoint : '{}' ".format(self.intemp, self.pluginsetpoint, self.setpoint))
+                    self.overheat = False
+                    #self.setpoint = self.septpointadjusted
+
+                # force heating mode or fan if overheat
+                if self.overheat :
+                    Domoticz.Debug("AC present overheating of '{}' - Setpoint is '{}' for Room Temp '{}'".format(self.overheatvalue, self.setpoint, self.intemp))
+                    if not self.WACmodevalue == self.MODE_FAN:
+                        for idx in self.WACmode:
+                            DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx, self.MODE_FAN))
+                        Domoticz.Debug("WACmode isn't at good Level at '{}'- Updating AC mode widget Level at '{}' for fan only".format(self.WACmodevalue, self.MODE_FAN))
+                        self.repeatordertime = datetime.now()
+                    if not self.WACfanspeedvalue == self.FAN_OVERHEAT:
+                        for idx in self.WACfanspeed:
+                            DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx, self.FAN_OVERHEAT))
+                        Domoticz.Debug("WACfanspeed isn't at good Level at '{}'- Updating AC fanspeed widget Level at '{}'".format(self.WACfanspeedvalue, self.FAN_OVERHEAT))
+                        self.repeatordertime = datetime.now()
+                else :  # no overheating, so heating Mode and auto control
+                    Domoticz.Debug("AC no present overheat - Setpoint is '{}' for Room Temp '{}'".format(self.setpoint, self.intemp))
+                    if not self.WACmodevalue == self.MODE_HEAT:
+                        for idx in self.WACmode:
+                            DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx, self.MODE_HEAT))
+                        Domoticz.Debug("WACmode isn't at good Level at '{}'- Updating AC mode widget Level at '{}' for heating".format(self.WACmodevalue, self.MODE_HEAT))
+                        self.repeatordertime = datetime.now()
+
+                    # NORMAL AUTO MODE -----------------------------------------------------------------------------------------------------
+                    if not self.PresenceTH:
+                        self.Turbofan = False
+                        self.Turbopower = False
+                    else :
+                        # check if turbo needed
+                        if self.intemp < (float(Devices[5].sValue) - (self.deltamax / 10)):
+                            self.Turbofan = True
+                        if self.intemp < (float(Devices[5].sValue) - ((self.deltamax / 10) + (self.deltamax / 20))):
+                            self.Turbopower = True
+
+                    # check if Turbofan is on
+                    if self.Turbofan:  # Turbofan is on
+                        Domoticz.Debug("AUTOMode - Turbofan ON - Fan speed high because room temp is too far from delta min setpoint")
+                        if not Devices[3].sValue == str(self.FAN_BOOST):
+                            Devices[3].Update(nValue=self.powerOn, sValue=str(self.FAN_BOOST))
+                        if not self.WACfanspeedvalue == self.FAN_BOOST:
+                            for idx in self.WACfanspeed:
+                                DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx, self.FAN_BOOST))
+                            Domoticz.Debug("WACfanspeed isn't at good Level at '{}'- Updating AC fanspeed widget Level at '{}'".format(self.WACfanspeedvalue, self.FAN_BOOST))
+                            self.repeatordertime = datetime.now()
+                            # check if turbofan still needed or not
+                        if self.intemp > (float(Devices[5].sValue) - (self.deltamax / 20)):
+                            self.Turbofan = False
+                    else:  # Turbofan is off
+                        Domoticz.Debug("AUTOMode - Turbofan OFF - Fan speed auto because room temp is near from setpoint")
+                        if not Devices[3].sValue == str(self.FAN_AUTO):
+                            Devices[3].Update(nValue=self.powerOn, sValue=str(self.FAN_AUTO))
+                        if not self.WACfanspeedvalue == self.FAN_AUTO:
+                            for idx in self.WACfanspeed:
+                                DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx, self.FAN_AUTO))
+                            Domoticz.Debug("WACfanspeed isn't at good Level at '{}'- Updating AC fanspeed widget Level at '{}'".format(self.WACfanspeedvalue, self.FAN_AUTO))
+                            self.repeatordertime = datetime.now()
+
+                    # check if Turbopower is on
+                    if self.Turbopower:  # Turbopower is on
+                        self.setpoint = 30
+                        Domoticz.Debug("AUTOMode - Turbopower ON - Used setpoint is Max '30' because room temp is lower more than delta min from setpoint")
+                        if not self.WACsetpointvalue == self.setpoint:
+                            for idx in self.WACsetpoint:
+                                DomoticzAPI("type=command&param=setsetpoint&idx={}&setpoint={}".format(idx, self.setpoint))
+                            Domoticz.Debug("AC Setpoint is not ok - Updating AC setpoint to : " + str(self.setpoint))
+                            self.repeatordertime = datetime.now()
+                            # self.WACsetpointvalue = self.setpoint
+                        # check if turbopower still needed or not
+                        if self.intemp > (float(Devices[5].sValue) - (self.deltamax / 10)):
+                            self.Turbopower = False
+                    else:  # Turbopower is off
+                        Domoticz.Debug("AUTOMode - Turbopower OFF - Used setpoint is normal : " + str(self.setpoint))
+                        self.setpoint = round(self.setpointadjusted)
+                        if not self.WACsetpointvalue == self.setpoint:
+                            for idx in self.WACsetpoint:
+                                DomoticzAPI("type=command&param=setsetpoint&idx={}&setpoint={}".format(idx, self.setpoint))
+                            Domoticz.Debug("AC Setpoint is not ok - Updating AC setpoint to : " + str(self.setpoint))
+                            self.repeatordertime = datetime.now()
+
+            # MANUAL MODE ----------------------------------------------------------------------------------------------------------
+            else:  # Manual Mode
+                self.setpoint = round(float(Devices[5].sValue))
+                # check manual asked mode
+                if Devices[2].sValue == "10":
+                    self.WACmodevaluenew = 10
+                elif Devices[2].sValue == "20":
+                    self.WACmodevaluenew = 20
+                elif Devices[2].sValue == "30":
+                    self.WACmodevaluenew = 30
+                elif Devices[2].sValue == "40":
+                    self.WACmodevaluenew = 40
+                elif Devices[2].sValue == "50":
+                    self.WACmodevaluenew = 50
+                # check if wac is ok
+                if not self.WACmodevaluenew == self.WACmodevalue:
+                    for idx in self.WACmode:
+                        DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx,self.WACmodevaluenew))
+                    self.repeatordertime = datetime.now()
+                    Domoticz.Debug("Manual mode - MODE = {}".format(self.WACmodevaluenew))
+                if not Devices[3].sValue == str(self.WACfanspeedvalue):
+                    for idx in self.WACfanspeed:
+                        DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx,str(Devices[3].sValue)))
+                    self.repeatordertime = datetime.now()
+                    Domoticz.Debug("Manual mode - FANSPEED = {}".format(self.WACfanspeedvalue))
+                if not self.WACsetpointvalue == self.setpoint:
+                    for idx in self.WACsetpoint:
+                        DomoticzAPI("type=command&param=setsetpoint&idx={}&setpoint={}".format(idx, self.setpoint))
+                    self.repeatordertime = datetime.now()
+                    Domoticz.Debug("AC Setpoint is not ok - Updating AC setpoint to : " + str(self.setpoint))
+
+        # READING ROOM TEMP ----------------------------------------------------------------------------------------------------
+        if self.nexttemps + timedelta(seconds=30) <= now:
+            self.readTemps(devicesAPI)
+
+        # NORMAL LOG -----------------------------------------------------------------------------------------------------------
+        if self.powerOn:
+            if self.ModeAuto:
+                Domoticz.Log("System ON - AUTO - Room Temp : {}ºC - System Setpoint : '{}' - Aircon Setpoint : '{}' ".format(self.intemp, self.pluginsetpoint, self.setpoint))
             else:
-                Domoticz.Log("System OFF")
+                Domoticz.Log("System ON - MANUAL - Room Temp : {}ºC - System Setpoint : '{}' - Aircon Setpoint : '{}' ".format(self.intemp, self.pluginsetpoint, self.setpoint))
+        else:
+            Domoticz.Log("System OFF")
 
     # OTHER DEF -----------------------------------------------------------------------------------------------------------
-    def readTemps(self):
+    def readTemps(self, devicesAPI=None):
         Domoticz.Debug("readTemps called")
         self.nexttemps = datetime.now()
         # fetch all the devices from the API and scan for sensors
         noerror = True
         listintemps = []
-        devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=temp&used=true&order=Name")
+        if devicesAPI is None:
+            devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=temp&used=true&order=Name")
         if devicesAPI:
-            for device in devicesAPI["result"]:
+            for device in devicesAPI["result"]:  # parse the devices for temperature sensors
                 idx = int(device["idx"])
                 if idx in self.InTempSensors:
-
-                    # Ignorer temporairement s'il est dans la liste d'exclusion
-                    if idx in self.TempExcludedUntil:
-                        if datetime.now() < self.TempExcludedUntil[idx]:
-                            Domoticz.Debug(
-                                f"Capteur température idx {idx} temporairement exclu jusqu’à {self.TempExcludedUntil[idx]}")
-                            continue
-                        else:
-                            del self.TempExcludedUntil[idx]  # Réintégrer après délai
-
-                    # Vérifier le status du capteur
-                    skip = False
-                    if device.get("HardwareName") != "Dummies":
-                        if device.get("HaveTimeout", False):
-                            skip = True
-                        else:
-                            last_update_str = device.get("LastUpdate")
-                            if last_update_str:
-                                try:
-                                    last_update = datetime.strptime(last_update_str, "%Y-%m-%d %H:%M:%S")
-                                    if datetime.now() - last_update > timedelta(minutes=30):
-                                        skip = True
-                                except Exception as e:
-                                    Domoticz.Error(f"Erreur de parsing LastUpdate pour capteur {device['Name']}: {e}")
-                                    skip = True
-
-                    if skip:
-                        self.TempExcludedUntil[idx] = datetime.now() + timedelta(minutes=15)
-                        Domoticz.Debug(f"Exclusion température idx {idx} jusqu’à {self.TempExcludedUntil[idx]} pour timeout ou LastUpdate trop vieux")
-                        Domoticz.Error("Device with idx '{}' named '{}' is TimedOut !".format(idx, device["Name"]))
-                        continue
-                    # Capteur valide
                     if "Temp" in device:
                         Domoticz.Debug("device: {}-{} = {}".format(device["idx"], device["Name"], device["Temp"]))
                         listintemps.append(device["Temp"])
                     else:
-                        Domoticz.Error( "device: {}-{} is not a Temperature sensor".format(device["idx"], device["Name"]))
+                        Domoticz.Error("device: {}-{} is not a Temperature sensor".format(device["idx"], device["Name"]))
 
         # calculate the average inside temperature
         nbtemps = len(listintemps)
         if nbtemps > 0:
             self.intemp = round(sum(listintemps) / nbtemps, 1)
-            Devices[7].Update(nValue=0, sValue=str(self.intemp))  # update the dummy device showing the current thermostat temp
+            Devices[7].Update(nValue=0,
+                              sValue=str(self.intemp))  # update the dummy device showing the current thermostat temp
         else:
-            Domoticz.Error("No Inside Temperature found or all are TimedOut... ")
+            Domoticz.Debug("No Inside Temperature found... ")
             noerror = False
 
-        Domoticz.Debug("Inside Temperature = {}".format(self.intemp))
+        self.WriteLog("Inside Temperature = {}".format(self.intemp), "Verbose")
         return noerror
 
-    def PresenceDetection(self):
+    def PresenceDetection(self, devicesAPI=None):
 
         Domoticz.Debug("PresenceDetection called")
 
@@ -788,54 +648,24 @@ class BasePlugin:
 
             # Build list of DT switches, with their current status
             PresenceDT = {}
-            devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=light&used=true&order=Name")
+            if devicesAPI is None:
+                devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=light&used=true&order=Name")
             if devicesAPI:
-                for device in devicesAPI["result"]:
+                for device in devicesAPI["result"]:  # parse the presence/motion sensors (DT) device
                     idx = int(device["idx"])
-                    if idx in self.DTpresence:
-                        # Vérifier si l’idx est encore exclu
-                        if idx in self.DTexcludedUntil:
-                            if datetime.now() < self.DTexcludedUntil[idx]:
-                                Domoticz.Debug(f"DT idx {idx} toujours exclu temporairement jusqu’à {self.DTexcludedUntil[idx]}")
-                                continue
-                            else:
-                                # Fin d’exclusion, on le remet dans la boucle
-                                del self.DTexcludedUntil[idx]
-                        # par défaut : considérer comme valide
-                        skip = False
-                        dummy = True
-                        if device.get("HardwareName") != "Dummies":
-                            dummy = False
-                            if device.get("HaveTimeout", False):
-                                skip = True
-                            else:
-                                last_update_str = device.get("LastUpdate")
-                                if last_update_str:
-                                    try:
-                                        last_update = datetime.strptime(last_update_str, "%Y-%m-%d %H:%M:%S")
-                                        if datetime.now() - last_update > timedelta(minutes=30):
-                                            skip = True
-                                    except Exception as e:
-                                        Domoticz.Error( "Erreur LastUpdate parsing pour '{}': {}".format(device["Name"], e))
-                                        skip = True
-                        if skip:
-                            self.DTexcludedUntil[idx] = datetime.now() + timedelta(minutes=15)
-                            Domoticz.Debug(f"Exclusion temporaire de {device['Name']} jusqu’à {self.DTexcludedUntil[idx]}")
-                            Domoticz.Error("Device with idx '{}' named '{}' is TimedOut !".format(idx, device["Name"]))
-                            continue
-                        # capteur accepté
+                    if idx in self.DTpresence:  # this is one of our DT
                         if "Status" in device:
                             PresenceDT[idx] = True if device["Status"] == "On" else False
-                            msg = "Dummy" if dummy else "DT"
-                            Domoticz.Debug(f"{msg} switch idx '{idx}' - '{device['Name']}' currently is '{device['Status']}'")
+                            Domoticz.Debug("DT switch idx '{}' - '{}' currently is '{}'".format(idx, device["Name"], device["Status"]))
                             if device["Status"] == "On":
                                 self.DTtempo = datetime.now()
+
                         else:
-                            Domoticz.Error("Device with idx '{}' named '{}' seem not a DT switch".format(idx, device["Name"]))
+                            Domoticz.Error("Device with idx '{}' and named '{}' does not seem to be a DT !".format(idx, device["Name"]))
 
             # fool proof checking....
             if len(PresenceDT) == 0:
-                Domoticz.Error("none of the devices in the 'dt' parameter is a dt or all are TimedOut... no action !")
+                Domoticz.Error("none of the devices in the 'dt' parameter is a dt... no action !")
                 self.Presencemode = False
                 self.Presence = False
                 self.PresenceTH = True
@@ -857,6 +687,7 @@ class BasePlugin:
                     self.PresenceSensor = True
                     self.Presence = True
                     self.presencechangedtime = datetime.now()
+
             else:
                 if not self.PresenceSensor:
                     Domoticz.Debug("No presence detected DT already OFF...")
@@ -873,6 +704,7 @@ class BasePlugin:
                         self.PresenceTH = True
                         self.PresenceTHdelay = datetime.now()
                         Devices[6].Update(nValue=1, sValue=Devices[6].sValue)
+
                     else:
                         Domoticz.Debug("Presence is INACTIVE but in timer ON period !")
                 elif self.PresenceTH:
@@ -882,6 +714,7 @@ class BasePlugin:
                     if self.presencechangedtime + timedelta(minutes=self.presenceoffdelay) <= now:
                         Domoticz.Debug("Presence is now INACTIVE because no DT since more than X minutes !")
                         self.PresenceTH = False
+
                     else:
                         Domoticz.Debug("Presence is ACTIVE but in timer OFF period !")
                 else:
@@ -889,14 +722,18 @@ class BasePlugin:
                     if Devices[6].nValue == 1:
                         Devices[6].Update(nValue=0, sValue=Devices[6].sValue)
 
-    def CAC221widgetcontrol(self):
+    def CAC221widgetcontrol(self, devicesAPI=None):
 
         Domoticz.Debug("CAC221widgetcontrol called")
 
-        devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=all&used=true&order=Name")
+        if devicesAPI is None:
+            devicesAPI = DomoticzAPI("type=command&param=getdevices&filter=all&used=true&order=Name")
         if devicesAPI:
             for device in devicesAPI["result"]:  # parse the device for finding widget of the cac
                 idx = int(device["idx"])
+                if idx in self.WAConoff and "Status" in device:
+                    self.WAConoffvalue = (device["Status"] == "On")
+                    Domoticz.Debug("WAConoff - idx '{}' - '{}' - Status is '{}' ".format(idx, device["Name"], device["Status"]))
                 if idx in self.WACmode:
                     Domoticz.Debug("WACmode - idx '{}' - '{}' - Level is '{}' ".format(idx, device["Name"], device["Level"]))
                     self.WACmodevalue = device["Level"]
@@ -911,36 +748,77 @@ class BasePlugin:
                     Domoticz.Debug("WACsetpoint -  idx '{}' - '{}' -  Setpoint is '{}' ".format(idx, device["Name"], device["SetPoint"]))
                     Domoticz.Debug("CAC SETPOINT IS = {}".format(self.WACsetpointvalue))
 
+    def setPower(self, on):
+        # Drive the AC power. On the Generic model power is a dedicated On/Off
+        # switch widget ; on the CAC221 power off is done by setting the mode
+        # widget to MODE_OFF (power on is handled by the mode control logic).
+        if self.power_widget:
+            if on and not self.WAConoffvalue:
+                for idx in self.WAConoff:
+                    DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=On".format(idx))
+                Domoticz.Debug("Power ON - switching On/Off widget(s) ON")
+            elif not on and self.WAConoffvalue:
+                for idx in self.WAConoff:
+                    DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Off".format(idx))
+                Domoticz.Debug("Power OFF - switching On/Off widget(s) OFF")
+        else:
+            if not on and not self.WACmodevalue == self.MODE_OFF:
+                for idx in self.WACmode:
+                    DomoticzAPI("type=command&param=switchlight&idx={}&switchcmd=Set Level&level={}".format(idx, self.MODE_OFF))
+                Domoticz.Debug("Power OFF - setting AC mode widget Level to '{}'".format(self.MODE_OFF))
+                self.repeatordertime = datetime.now()
+
+    def syncSelectorOptions(self, unit, levelnames):
+        # Update a selector device's LevelNames if they no longer match the
+        # selected model (e.g. the user switched AC Model on an existing install).
+        if unit in Devices and Devices[unit].Options.get("LevelNames") != levelnames:
+            Options = {"LevelActions": "||",
+                       "LevelNames": levelnames,
+                       "LevelOffHidden": "true",
+                       "SelectorStyle": "0"}
+            Devices[unit].Update(nValue=Devices[unit].nValue, sValue=Devices[unit].sValue, Options=Options)
+            Domoticz.Debug("Updated selector Unit {} LevelNames to '{}'".format(unit, levelnames))
+
+    def WriteLog(self, message, level="Normal"):
+
+        if self.loglevel == "Verbose" and level == "Verbose":
+            Domoticz.Log(message)
+        elif level == "Normal":
+            Domoticz.Log(message)
+
 
 # Plugin functions ---------------------------------------------------
 
 global _plugin
 _plugin = BasePlugin()
 
+
 def onStart():
     global _plugin
     _plugin.onStart()
+
 
 def onStop():
     global _plugin
     _plugin.onStop()
 
+
 def onCommand(Unit, Command, Level, Color):
     global _plugin
     _plugin.onCommand(Unit, Command, Level, Color)
+
 
 def onHeartbeat():
     global _plugin
     _plugin.onHeartbeat()
 
+
 # Plugin utility functions ---------------------------------------------------
+
 
 def parseCSV(strCSV):
     listvals = []
     for value in strCSV.split(","):
-        value = value.strip()
-        if value == "":
-            continue
         try:
             val = int(value)
             listvals.append(val)
@@ -949,8 +827,9 @@ def parseCSV(strCSV):
                 val = float(value)
                 listvals.append(val)
             except ValueError:
-                Domoticz.Error(f"Skipping non-numeric value: '{value}'")
+                Domoticz.Error(f"Skipping non-numeric value: {value}")
     return listvals
+
 
 def DomoticzAPI(APICall):
     resultJson = None
@@ -982,6 +861,8 @@ def DomoticzAPI(APICall):
         Domoticz.Error(f"Error calling '{url}': {e}")
 
     return resultJson
+
+
 
 def CheckParam(name, value, default):
     try:
