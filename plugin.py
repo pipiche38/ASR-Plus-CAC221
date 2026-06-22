@@ -15,13 +15,7 @@
         <h3>Set-up and Configuration</h3>
     </description>
     <params>
-        <param field="Port" label="AC Model" width="200px">
-            <options>
-                <option label="CAC221" value="CAC221" default="true"/>
-                <option label="Generic-OnOff (HOT/COLD/FAN, multi-speed)" value="Generic-OnOff"/>
-            </options>
-        </param>
-        <param field="Address" label="On/Off widget idx (csv list, Generic model only)" width="100px" required="false" default=""/>
+        <param field="Address" label="On/Off widget idx (csv list). If set, uses the Generic On/Off model (HOT/COLD/FAN, multi-speed fan) ; if empty, uses the CAC221 model." width="300px" required="false" default=""/>
         <param field="Username" label="AC mode widget idx (csv list)" width="100px" required="true" default=""/>
         <param field="Password" label="AC fanspeed widget idx (csv list)" width="100px" required="true" default=""/>
         <param field="Mode1" label="AC Setpoint widget idx (csv list)" width="100px" required="true" default=""/>
@@ -179,10 +173,11 @@ class BasePlugin:
             self.debug = False
             Domoticz.Debugging(0)
 
-        # select the AC model profile and copy its level constants / labels
-        self.acmodel = Parameters["Port"] if Parameters["Port"] in AC_PROFILES else "CAC221"
-        if Parameters["Port"] not in AC_PROFILES:
-            Domoticz.Error("Unknown AC Model '{}' - falling back to 'CAC221'".format(Parameters["Port"]))
+        # select the AC model profile and copy its level constants / labels.
+        # The model is auto-detected: a configured On/Off widget idx means the
+        # Generic On/Off model (separate power widget) ; otherwise the CAC221.
+        self.WAConoff = parseCSV(Parameters["Address"])
+        self.acmodel = "Generic-OnOff" if self.WAConoff else "CAC221"
         profile = AC_PROFILES[self.acmodel]
         self.power_widget = profile["power_widget"]
         self.MODE_HEAT = profile["MODE_HEAT"]
@@ -191,7 +186,7 @@ class BasePlugin:
         self.FAN_AUTO = profile["FAN_AUTO"]
         self.FAN_BOOST = profile["FAN_BOOST"]
         self.FAN_OVERHEAT = profile["FAN_OVERHEAT"]
-        Domoticz.Debug("AC model = '{}' (power_widget={})".format(self.acmodel, self.power_widget))
+        Domoticz.Debug("AC model = '{}' (power_widget={}) - On/Off widget idx = {}".format(self.acmodel, self.power_widget, self.WAConoff))
 
         # create the child devices if these do not exist yet
         devicecreated = []
@@ -245,8 +240,6 @@ class BasePlugin:
         self.syncSelectorOptions(3, profile["fan_names"])
 
         # build lists of idx widget of the AC
-        self.WAConoff = parseCSV(Parameters["Address"])
-        Domoticz.Debug("AC On/Off widget idx = {}".format(self.WAConoff))
         self.WACmode = parseCSV(Parameters["Username"])
         Domoticz.Debug("AC mode widget idx = {}".format(self.WACmode))
         self.WACfanspeed = parseCSV(Parameters["Password"])
